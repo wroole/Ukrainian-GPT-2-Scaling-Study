@@ -1,0 +1,7 @@
+datasets
+jupyter
+numpy
+pandas
+tokenizers
+torch
+transformers
