@@ -208,3 +208,7 @@ Both model notebooks import `create_model` from `create_model.py`. This helper c
 | `results/model_comparison.png` | The graph for comparing models |
 
 Git ignores `data/`, `models/`, `tokenizer/`, and `results/`. You need to copy these folders separately or create their files again. The graph is also inside the ignored `results/` folder. For it to appear on GitHub, the image needs to be added to Git or moved to a tracked folder, with the image link updated.
+
+## Share your results
+
+If you try this experiment, I would like to see your results! Open an [issue](https://github.com/wroole/Ukrainian-GPT-2-Scaling-Study/issues) and share your model size, training budget, test scores, and a few text examples. Ideas and questions are welcome too.
