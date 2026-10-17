@@ -54,9 +54,13 @@ WEIGHT_DECAY = 0.1
 
 EVAL_EVERY = 250
 EVAL_BATCHES = 50
-MODEL_SIZE = "3M"
+MODEL_SIZE = "20M"
 MODEL_NAME = f"{MODEL_SIZE}_model_on_{TRAIN_TOKENS // 1000000}M_tokens"
 MODEL_DIR = Path("models")
+
+USE_BF16 = True
+COMPILE_MODEL = True
+TOKENS_ON_GPU = True
 
 # %%
 train_tokens = np.memmap(
@@ -85,10 +89,28 @@ device = torch.device(
     else "cpu"
 )
 
+use_bf16 = (
+    USE_BF16
+    and device.type == "cuda"
+    and torch.cuda.is_bf16_supported()
+)
+
+if device.type == "cuda" and TOKENS_ON_GPU:
+    train_tokens = torch.from_numpy(
+        np.array(train_tokens, dtype=np.int32)
+    ).to(device)
+
+    val_tokens = torch.from_numpy(
+        np.array(val_tokens, dtype=np.int32)
+    ).to(device)
+
+    print("Training and validation tokens loaded on GPU.")
+
 model = create_model(MODEL_SIZE)
 model = model.to(device)
 
 print(device)
+print("BF16:", use_bf16)
 
 
 # %%
@@ -100,34 +122,35 @@ def get_batch(
 ):
     max_start = len(tokens) - seq_len - 1
 
+    if isinstance(tokens, torch.Tensor):
+        starts = torch.randint(
+            0,
+            max_start,
+            (batch_size,),
+            device=tokens.device,
+        )
+
+        positions = starts[:, None] + torch.arange(
+            seq_len,
+            device=tokens.device,
+        )
+
+        return tokens[positions].to(device=device, dtype=torch.long)
+
     starts = np.random.randint(
         0,
         max_start,
         size=batch_size,
     )
 
-    x = np.stack([
-        tokens[i:i + seq_len]
-        for i in starts
-    ])
-
-    y = np.stack([
-        tokens[i + 1:i + seq_len + 1]
-        for i in starts
-    ])
+    positions = starts[:, None] + np.arange(seq_len)
+    x = tokens[positions]
 
     x = torch.from_numpy(
         x.astype(np.int64)
     )
 
-    y = torch.from_numpy(
-        y.astype(np.int64)
-    )
-
-    x = x.to(device)
-    y = y.to(device)
-
-    return x, y
+    return x.to(device)
 
 
 # %%
@@ -158,7 +181,7 @@ def evaluate(
     losses = []
 
     for _ in range(num_batches):
-        x, y = get_batch(
+        x = get_batch(
             tokens=tokens,
             batch_size=batch_size,
             seq_len=seq_len,
@@ -171,12 +194,12 @@ def evaluate(
         )
 
         losses.append(
-            outputs.loss.item()
+            outputs.loss.detach()
         )
 
     model.train()
 
-    return float(np.mean(losses))
+    return torch.stack(losses).mean().item()
 
 
 # %%
@@ -199,7 +222,12 @@ def train(model, train_tokens, val_tokens, device):
         ],
         lr=MAX_LR,
         betas=(0.9, 0.95),
+        fused=device.type == "cuda",
     )
+
+    train_model = model
+    if device.type == "cuda" and COMPILE_MODEL:
+        train_model = torch.compile(model, mode="reduce-overhead")
 
     tokens_per_step = BATCH_SIZE * SEQ_LEN
     max_steps = math.ceil(TRAIN_TOKENS / tokens_per_step)
@@ -211,11 +239,15 @@ def train(model, train_tokens, val_tokens, device):
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     model.train()
-    start_time = time.time()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    start_time = time.perf_counter()
+    log_time = start_time
 
     for step in range(1, max_steps + 1):
 
-        x, y = get_batch(
+        x = get_batch(
             tokens=train_tokens,
             batch_size=BATCH_SIZE,
             seq_len=SEQ_LEN,
@@ -228,8 +260,13 @@ def train(model, train_tokens, val_tokens, device):
 
         optimizer.zero_grad(set_to_none=True)
 
-        outputs = model(input_ids=x, labels=x)
-        loss = outputs.loss
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=use_bf16,
+        ):
+            outputs = train_model(input_ids=x, labels=x)
+            loss = outputs.loss
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -237,18 +274,26 @@ def train(model, train_tokens, val_tokens, device):
         optimizer.step()
 
         if step % 50 == 0:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
             tokens_seen = step * tokens_per_step
-            elapsed = time.time() - start_time
+            now = time.perf_counter()
+            elapsed = now - start_time
+            tokens_per_second = 50 * tokens_per_step / (now - log_time)
             print(
                 f"step={step:5d} "
                 f"tokens={tokens_seen / 1e6:8.2f}M "
                 f"loss={loss.item():.4f} "
                 f"lr={lr:.2e} "
                 f"gnorm={grad_norm:.2f} "
-                f"time={elapsed:.1f}s"
+                f"time={elapsed:.1f}s "
+                f"tok/s={tokens_per_second:,.0f}"
             )
+            log_time = time.perf_counter()
 
         if step % EVAL_EVERY == 0 or step == max_steps or step in save_steps:
+            eval_start = time.perf_counter()
 
             val_loss = evaluate(
                 model=model,
@@ -297,6 +342,11 @@ def train(model, train_tokens, val_tokens, device):
 
                 print(f"Saved model on {tokens // 1000000}M tokens.")
 
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+            log_time += time.perf_counter() - eval_start
+
 
 # %%
 train(
@@ -305,6 +355,9 @@ train(
     val_tokens=val_tokens,
     device=device,
 )
+
+del train_tokens
+del val_tokens
 
 # %%
 device = torch.device(
@@ -350,7 +403,6 @@ def evaluate_test(
     )
 
     batch_x = []
-    batch_y = []
 
     for start in starts:
 
@@ -358,21 +410,12 @@ def evaluate_test(
             start:start + seq_len
         ]
 
-        y = tokens[
-            start + 1:start + seq_len + 1
-        ]
-
         batch_x.append(x)
-        batch_y.append(y)
 
         if len(batch_x) == batch_size:
 
             x = torch.from_numpy(
                 np.stack(batch_x).astype(np.int64)
-            ).to(device)
-
-            y = torch.from_numpy(
-                np.stack(batch_y).astype(np.int64)
             ).to(device)
 
             outputs = model(
@@ -382,22 +425,17 @@ def evaluate_test(
 
             loss = outputs.loss
 
-            n = y.numel()
+            n = x.numel()
 
             total_loss += loss.item() * n
             total_tokens += n
 
             batch_x.clear()
-            batch_y.clear()
 
     # leftover batch
     if batch_x:
         x = torch.from_numpy(
             np.stack(batch_x).astype(np.int64)
-        ).to(device)
-
-        y = torch.from_numpy(
-            np.stack(batch_y).astype(np.int64)
         ).to(device)
 
         outputs = model(
@@ -407,7 +445,7 @@ def evaluate_test(
 
         loss = outputs.loss
 
-        n = y.numel()
+        n = x.numel()
 
         total_loss += loss.item() * n
         total_tokens += n
