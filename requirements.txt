@@ -5,3 +5,4 @@ pandas
 tokenizers
 torch
 transformers
+matplotlib
