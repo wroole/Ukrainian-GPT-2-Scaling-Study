@@ -22,6 +22,13 @@ MODEL_CONFIGS = {
         "n_embd": 320,
         "n_inner": 1280,
     },
+
+    "60M": {
+        "n_layer": 16,
+        "n_head": 16,
+        "n_embd": 512,
+        "n_inner": 2048,
+    },
 }
 
 def create_model(model_size: str):
